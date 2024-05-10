@@ -1,0 +1,429 @@
+---
+title: "Exploring the SARS-CoV-2 nucleocapsid protein"
+author: "Soo Jen Low"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+<br>
+<br>
+ 
+#### Let's load the packages we will need
+```{r load-libraries, warnings=F, message=F}
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(ggsci)
+library(scales)
+library(ggpubr)
+library(knitr)
+library(tibble)
+library(Biostrings)
+library(msa)
+library(tibble)
+library(openxlsx)
+```
+
+<br>
+<br>
+
+#### Then read in our NextStrain metadata file, protein alignment file, and generate necessary data frames for downstream analyses
+```{r read-files}
+# Read in NextStrain subsampled metadata file
+subsampled <- fread("./nextstrain_data/metadata_subsampled.tsv", header=T)
+
+nextstrain_clades <- unique(subsampled$Nextstrain_clade)
+nonhuman_strains <- subsampled %>% 
+  filter(host!="Homo sapiens") %>% 
+  pull(genbank_accession)
+
+# Read in nucleocapsid multiple sequence alignment (MSA)
+# Protein sequences were obtained from NCBI GenBank using accessions in NextStrain metadata file, and then aligned with MUSCLE
+# In our MSA of 419AA, 3 columns removed from MSA, and X replaced with gaps
+
+mymsa <- readAAMultipleAlignment("./N_alignment/nucleocapsid_extract_419aa_clean_gaps.aln", format="fasta")
+mymsa <- unmasked(mymsa)
+mymsa
+
+# If we look at the MSA we will notice that some sequences are composed of many gaps
+# Let's remove genomes/sequences where there are more than X% gaps (let's set 10% for example) in the nucleocapsid protein, as well as sequences with non-human hosts
+
+check_gaps <- function(seq, threshold) {
+  out <- alphabetFrequency(mymsa[[seq]])[["-"]]/419 > threshold
+  out
+}
+myres <- lapply(1:3270, check_gaps, threshold=0.1)  ## change gap threshold here
+       
+pass <- which(sapply(myres, function(x) !isTRUE(x)))  ## these are sequences passing our gap threshold
+mymsa <- mymsa[pass]  ## update our MSA, removing highly gapped sequences
+mymsa <- mymsa[setdiff(names(mymsa), nonhuman_strains)]  ## remove non-human sequences
+genomes_present_msa <- names(mymsa)  ## get a list of all genomes in our filtered MSA
+
+# Check how many sequences we have in our filtered dataset
+length(genomes_present_msa)
+
+# Set accession of Wuhan-Hu-1 as reference sequence in MSA
+ref <- mymsa["MN908947"]
+
+# Generate a filtered metadata df from the original, which we will be using later on
+metadata_filtered <- subsampled %>% 
+  filter(genbank_accession %in% genomes_present_msa)
+head(select(metadata_filtered, strain, genbank_accession, Nextstrain_clade, pango_lineage))
+                                         
+# Let's look at the distribution of variant genomes in our filtered dataset
+metadata_filtered %>% 
+  group_by(Nextstrain_clade) %>%
+  summarize(count_genomes=n_distinct(genbank_accession)) %>% 
+  ggplot(aes(x=reorder(Nextstrain_clade, count_genomes), y=count_genomes)) +
+  geom_bar(stat="identity", fill="dark red") +
+  geom_text(aes(label=count_genomes), hjust=0, size=2.8) +
+  xlab("Variant") +
+  ylab("Number of sequences") +
+  theme_minimal() +
+  coord_flip()
+
+# Define domains within the nucleocapsid to help us identify where mutations are occurring
+# Domain positions obtained from Yang et al. (2021) 
+# https://www.frontiersin.org/articles/10.3389/fchem.2020.624765/full
+domains_df <- data.frame(c(1:419))
+names(domains_df) <- "msa_position"
+domains_df <- domains_df %>%
+  mutate(domain = case_when(msa_position>=1 & msa_position<=40 ~ "NTD",
+                            msa_position>=41 & msa_position<=173 ~ "RBD",
+                            msa_position>=174 & msa_position<=249 ~ "LINK",
+                            msa_position>=250 & msa_position<=364 ~ "dimerization",
+                            msa_position>=365 ~ "CTD",
+                            TRUE ~ "NA"))
+domains <- c("NTD", "RBD", "LINK", "dimerization", "CTD")
+```
+<br>
+<br>
+
+#### Get frequencies of all genotypes (per column summary) for each variant relative to Wuhan-Hu-1
+```{r warning=FALSE}
+# Let's transfer the reference sequence info into a data frame
+ref_df <- as.matrix(mymsa["MN908947"]) %>% t()
+ref_df <- ref_df[, 1] %>% 
+  as.data.frame(check.names=F) %>% 
+  rowid_to_column(var="msa_position") %>%
+  dplyr::rename("residue_reference" = ".")
+
+
+# Function to identify major residues per MSA column per lineage
+get_genotypes <- function(myvariant, mydf) {
+  genomes <- filter(metadata_filtered, Nextstrain_clade==myvariant) %>% pull(genbank_accession)
+  subaln <- mymsa[genomes] ##filter to only sequences present in MSA
+  ncols <- length(subaln[[1]])
+  mat <- as.matrix(subaln)  ## convert MSA into matrix
+ 
+  
+  ## We will use a nested function here to get stats of all MSA columns
+  ## This part needs to be optimized
+  get_colstats <- function(mypos, mysubaln) {
+    table <- prop.table(table(mat[, mypos])) %>%
+      round(digits=3) %>% 
+      as.data.frame.table() %>% 
+      dplyr::rename(residue=Var1, freq=Freq) %>%
+      mutate(msa_position=mypos, variant=myvariant) %>%
+      left_join(domains_df, by="msa_position") %>% 
+      left_join(ref_df, by="msa_position") %>% 
+      relocate(msa_position)
+    table
+  }
+  
+  results <- rbindlist(lapply(1:ncols, get_colstats, mysubaln=subaln))
+  results
+}
+
+mycolstats_df <- rbindlist(lapply(nextstrain_clades, get_genotypes, mydf=metadata_filtered))
+mycolstats_df$domain <- factor(mycolstats_df$domain, levels=domains)
+
+```
+
+<br>
+<br>
+
+#### Now that we have our information in a data frame, we can manipulate this to help us in making some plots
+```{r global-view, fig.width = 5, fig.height = 3.8}
+#    Let's make a new data frame from that with the following information:
+#      i)    whether the residue is a mutation
+#      ii)   whether we want to keep the residue for plotting (set freq threshold here, eg. present in at least 2% of genome population- applied but not used for now)
+#      iii)  the proportion of genomes with mutations for a given variant population
+
+threshold <- 0.02
+mycolstats_df <- mycolstats_df %>% 
+  mutate(mutation = case_when(residue == "-" ~ "NA", 
+                              residue == residue_reference ~ "no", 
+                              TRUE ~ "yes"),
+                              keep = case_when(freq >=threshold & mutation == "yes" ~ "yes", TRUE ~ "no"))
+
+
+residues_df <- mycolstats_df %>% 
+  group_by(variant, msa_position, domain) %>% 
+  summarize(prop_unchanged=sum(freq[mutation=="no"]), 
+            prop_missing=sum(freq[mutation=="NA"]), 
+            prop_mutation=1-prop_unchanged-prop_missing)
+
+    
+# We can now visualize where mutations are occurring for the different variants
+residues_df %>% 
+  ggplot(aes(x=msa_position, y=prop_mutation)) + 
+  geom_point(size=0.5, aes(color=domain)) +
+  scale_fill_npg() +
+  scale_color_npg() +
+  geom_hline(yintercept=threshold, linetype="twodash") +
+  geom_vline(xintercept=c(40, 173, 249, 364, 419), linetype="dotdash", color="gray") +
+  xlab("Residue (position)") +
+  ylab("Proportion of genomes with mutations") +
+  theme(axis.text=element_text(size=8), axis.title=element_text(size=10), plot.title=element_text(hjust=0.5)) +
+  facet_wrap(.~variant, nrow=6) +
+  ggtitle("Mutation frequencies across nucleocapsid domains of SARS-CoV-2 variants")
+
+# In the plot above, the x-axis is the residue/position in the MSA and the y-axis is the proportion of genomes within a variant with mutations (compared to Wuhan-Hu-1)
+
+# What about the domains where mutations most commonly occur? This is a simplified view of the previous plot
+domain_mutations_df <- residues_df %>%
+  group_by(variant, domain) %>% 
+  summarize(no_mutations=n_distinct(msa_position[prop_mutation<threshold])/n(), with_mutations=1-no_mutations) %>%
+  reshape2::melt(id.vars=c("variant", "domain"), value.name="prop") 
+  
+domain_mutations_df %>%
+  ggplot(aes(x=domain, y=prop)) + 
+  geom_bar(stat="identity", aes(fill=variable)) + 
+  scale_fill_manual(values=c("#D2F0EE", "#D21F3C"), name="") + 
+  theme(axis.text=element_text(size=8), axis.title=element_text(size=10), plot.title=element_text(hjust=0.5)) +
+  scale_x_discrete(limits = rev) +
+  xlab("") +
+  ylab("Proportion of genomes") +
+  facet_wrap(.~variant, nrow=6) +
+  coord_flip() +
+  ggtitle("Mutation frequencies across nucleocapsid domains of SARS-CoV-2 variants")
+
+# For a list of positions and mutation frequencies please see Excel sheet
+
+```
+
+<br>
+<br>
+
+#### Let's get an idea of what mutations are present (considering only the consensus sequence for each variant)
+```{r plot-consensus}
+# Let's look at only positions with mutations
+# First let's get a MSA consensus sequence for each variant
+
+get_conseq <- function(myvariant) {
+  # first filter MSA by selecting genomes corresponding to variant
+  genomes <- filter(metadata_filtered, Nextstrain_clade==myvariant) %>% pull(genbank_accession)
+  alnkeep <- AAMultipleAlignment(mymsa[genomes])
+  conseq <- strsplit(msaConsensusSequence(alnkeep, ignoreGaps=T), "") %>%
+    unlist() %>% 
+    as.data.frame() %>% 
+    mutate(variant=myvariant) %>%
+    dplyr::rename("residue" = ".") %>% 
+    rowid_to_column(var="msa_position")
+  conseq
+}
+
+conseq_df <- rbindlist(lapply(nextstrain_clades, get_conseq))
+conseq_df <- conseq_df %>%
+  left_join(ref_df) %>%
+  left_join(domains_df) %>% 
+  mutate(mutation = case_when(residue == "-" ~ "NA",
+                              residue != residue_reference ~ "yes",
+                              TRUE ~ "no"))
+                            
+# Only plot positions with mutations
+positions2plot <- conseq_df %>% 
+  filter(mutation=="yes" | mutation=="NA") %>% 
+  pull(msa_position)
+
+# Set msa position column as factors                           
+conseq_df$msa_position <- factor(conseq_df$msa_position, levels=unique(conseq_df$msa_position))
+conseq_df$mutation <- factor(conseq_df$mutation, levels=c("yes", "no", "NA"))
+conseq_df$domain <- factor(conseq_df$domain, levels=domains)
+
+# Plot
+conseq_df %>% 
+  filter(msa_position %in% positions2plot) %>% 
+  ggplot(aes(x=msa_position, y=variant, fill=mutation)) +
+  geom_tile(color="white", size=0.2) +
+  geom_text(aes(label=residue), size=2.5) +
+  scale_fill_manual(values=c("#D21F3C", "#D2F0EE","#D4D4D4")) +
+  theme(axis.text.x=element_text(angle=90), plot.title=element_text(hjust=0.5)) + 
+  xlab("Residue position") +
+  ylab("Variant") +
+  facet_wrap(.~domain, nrow=1, scales="free_x") +
+  ggtitle("Mutations in nucleocapsid across consensus sequence of SARS-CoV-2 variants")
+
+# The dimerization domain does not have mutations according to the 'consensus sequence' of each variant
+
+```
+
+<br>
+<br>
+
+#### Next let's look at individual genotypes for our variants of interest
+```{r plot-genotypes, warnings=FALSE, message=FALSE, fig.width = 5, fig.height = 3}
+# We can define which variant we want to look at (eg. VOCs or all variants with at least 10 genome representatives)
+# Let's look at the alpha, beta, gamma, delta, and omicron variants for now
+
+plot_genotype_mutations <- function(myvariant) {
+  genomes <- filter(metadata_filtered, Nextstrain_clade==myvariant) %>% pull(genbank_accession)
+  alnkeep <- as.matrix(unique(mymsa[genomes])) %>%
+    t() %>% 
+    as.data.frame() %>% 
+    rowid_to_column(var="msa_position")
+  
+  # force reference sequence to be in dataset
+  alnref <- as.matrix(mymsa["MN908947"]) %>%
+    t() %>% 
+    as.data.frame() %>% 
+    rowid_to_column(var="msa_position")
+  
+  # add ref only if it's not already present
+  if (!"MN908947" %in% names(alnkeep)) {
+    myaln <- left_join(alnkeep, alnref, by="msa_position")
+  } else {
+    myaln <- alnkeep
+  }
+  
+  myplotdf <- myaln %>% 
+    #filter(msa_position %in% positions2plot) %>% 
+    reshape2::melt(id.var="msa_position", variable.name="genome", value.name="residue") %>% 
+    left_join(ref_df, by="msa_position") %>%
+    left_join(domains_df, by="msa_position") %>%
+    mutate(mutation=case_when(residue=="-" ~ "NA",
+                              residue!=residue_reference ~ "yes",
+                              residue==residue_reference ~ "no",
+                              TRUE ~ "error")) 
+  
+  # Rename reference sequence
+  myplotdf$genome <- gsub("MN908947", "Wuhan-Hu-1", myplotdf$genome)
+  
+  myplotdf$domain <- factor(myplotdf$domain, levels=domains)
+  myplotdf$msa_position <- factor(myplotdf$msa_position, levels=unique(myplotdf$msa_position))
+  myplotdf$mutation <- factor(myplotdf$mutation, levels=c("yes", "no", "NA"))
+  
+  positions2plot <- myplotdf %>% 
+    filter(mutation=="yes" | mutation=="NA") %>% 
+    distinct(msa_position) %>% 
+    pull(msa_position)
+  
+  myplot <- myplotdf %>%
+    filter(msa_position %in% positions2plot) %>% 
+    ggplot(aes(x=msa_position, y=genome, fill=mutation)) +
+    geom_tile(color="white", size=0.2) +
+    geom_text(aes(label=residue), size=2.5) +
+    scale_fill_manual(values=c("#D21F3C", "#D2F0EE","#D4D4D4")) +
+    theme(axis.text.x=element_text(angle=90, size=7), plot.title=element_text(hjust=0.5), axis.text.y=element_text(size=5)) + 
+    xlab("Residue position") +
+    ylab("Genome") +
+    facet_wrap(.~domain, nrow=1, scales="free_x") +
+    ggtitle(paste(myvariant, " genotypes", sep=""))
+  
+  myplot
+ 
+}
+
+# Run function on our variants of interest
+voi <- c("20I (Alpha, V1)", "20H (Beta, V2)", "20J (Gamma, V3)", "21A (Delta)", "21I (Delta)", "21K (Omicron)")
+genotype_plots <- lapply(voi, plot_genotype_mutations)
+genotype_plots[[1]]
+genotype_plots[[2]] + genotype_plots[[3]] 
+genotype_plots[[4]]
+genotype_plots[[5]] 
+genotype_plots[[6]]
+
+```
+
+<br>
+<br>
+
+#### Write mutations to a file
+```{r write-mutations, message=FALSE}
+print_mutations <- function(myvariant, myoption) {
+  if (myvariant == "all") {
+    subaln <- mymsa
+    
+  } else {
+    genomes <- filter(metadata_filtered, Nextstrain_clade==myvariant) %>% pull(genbank_accession)
+    subaln <- mymsa[genomes] ##filter to only sequences present in MSA
+  }
+ 
+  ncols <- length(subaln[[1]])
+  mat <- as.matrix(subaln)  ## convert MSA into matrix
+  
+  ## This part needs to be optimized
+  get_colstats <- function(mypos, mysubaln) {
+    table <- table(mat[, mypos]) %>%
+      as.data.frame.table() %>% 
+      dplyr::rename(residue=Var1, freq=Freq) %>%
+      mutate(msa_position=mypos, variant=myvariant) %>%
+      left_join(domains_df, by="msa_position") %>% 
+      left_join(ref_df, by="msa_position") %>% 
+      relocate(msa_position)
+    table
+  }
+  
+  results <- rbindlist(lapply(1:ncols, get_colstats, mysubaln=subaln))
+  
+  if (myoption == "no") {
+    results <- results %>% group_by(msa_position, domain) %>%
+      summarize(count_mutations=sum(freq[residue!=residue_reference & residue!="-"]), 
+              count_conserved=sum(freq[residue==residue_reference | residue=="-"])) %>% 
+      mutate(variant=myvariant, total=sum(count_mutations, count_conserved),
+             mutation_percentage=count_mutations/total*100, conserved_percentage=count_conserved/total*100) %>%
+      select(-total)
+    
+  } else if (myoption == "yes") {
+    
+    results <- results %>% group_by(msa_position, domain, residue, residue_reference) %>%
+    summarize(count_mutations=sum(freq[residue!=residue_reference & residue!="-"]), 
+              count_conserved=sum(freq[residue==residue_reference | residue=="-"])) %>%
+    ungroup() %>%
+    group_by(msa_position, domain) %>%
+    mutate(variant=myvariant, total=sum(count_mutations, count_conserved), mutation_percentage=count_mutations/total*100, conserved_percentage=count_conserved/total*100) %>%
+    select(-total)
+  }
+
+  results
+}
+
+mutations_variant_noresidue <- rbindlist(lapply(nextstrain_clades, print_mutations, myoption="no"))
+mutations_variant_wresidue <- rbindlist(lapply(nextstrain_clades, print_mutations, myoption="yes"))
+mutations_all_noresidue <- print_mutations("all", myoption="no")
+mutations_all_wresidue <- print_mutations("all", myoption="yes")
+
+# Write summary tables to separate sheets in an Excel file
+write.xlsx(mutations_variant_noresidue, file="./results/mutations_summary.xlsx", 
+           sheetName="variants_general", 
+           colNames=T,
+           rowNames=F,
+           append=F)
+write.xlsx(mutations_variant_noresidue, file="./results/mutations_summary.xlsx", 
+           sheetName="variants_withAA",
+           colNames=T,
+           rowNames=F,
+           append=T)
+write.xlsx(mutations_variant_noresidue, file="./results/mutations_summary.xlsx", 
+           sheetName="combined_general", 
+           colNames=T,
+           rowNames=F,
+           append=T)
+write.xlsx(mutations_variant_noresidue, file="./results/mutations_summary.xlsx", 
+           sheetName="combined_withAA", 
+           colNames=T,
+           rowNames=F,
+           append=T)
+
+# Remove unused data frames
+rm(list=c("mutations_variant_noresidue", "mutations_variant_wresidue", "mutations_all_noresidue", "mutations_all_wresidue"))
+
+```
+
+
